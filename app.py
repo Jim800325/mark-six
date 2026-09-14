@@ -14761,6 +14761,51 @@ def cleanup_expired_data_job():
 
 _warmup_thread = None
 _warmup_started = False
+_ml_warmup_thread = None
+_ml_warmup_started = False
+_ml_warmup_lock_path = None
+_ml_warmup_lock_acquired = False
+
+
+def _try_acquire_ml_warmup_lock():
+    import tempfile
+    global _ml_warmup_lock_path, _ml_warmup_lock_acquired
+    if _ml_warmup_lock_acquired:
+        return True
+    lock_path = os.path.join(tempfile.gettempdir(), "mark-six-ml-warmup.lock")
+    pid = os.getpid()
+    try:
+        fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        with os.fdopen(fd, "w") as f:
+            f.write(str(pid))
+        _ml_warmup_lock_path = lock_path
+        _ml_warmup_lock_acquired = True
+        return True
+    except FileExistsError:
+        try:
+            with open(lock_path, "r") as f:
+                existing_pid = int((f.read() or "").strip() or "0")
+        except Exception:
+            existing_pid = 0
+        if existing_pid and _pid_is_running(existing_pid):
+            return False
+        try:
+            os.remove(lock_path)
+        except OSError:
+            return False
+        return _try_acquire_ml_warmup_lock()
+
+
+def _release_ml_warmup_lock():
+    global _ml_warmup_lock_path, _ml_warmup_lock_acquired
+    if not _ml_warmup_lock_acquired or not _ml_warmup_lock_path:
+        return
+    try:
+        os.remove(_ml_warmup_lock_path)
+    except OSError:
+        pass
+    _ml_warmup_lock_path = None
+    _ml_warmup_lock_acquired = False
 
 
 def warmup_ml_prediction_cache(regions=None):
@@ -14768,38 +14813,57 @@ def warmup_ml_prediction_cache(regions=None):
 
     Runs inside an application context so DB access is available. Safe to call
     repeatedly: existing cache entries short-circuit the build.
+    Includes deadlock retry logic for MySQL.
     """
     regions = tuple(regions or ("hk", "macau"))
     with app.app_context():
         for region in regions:
-            try:
-                data, _ = _get_prediction_data(region, str(datetime.now().year))
-                if not data:
-                    continue
-                _build_ml_prediction_artifacts(data, region)
-                print(f"ML 预测缓存预热完成：{region}")
-            except Exception as e:
-                print(f"ML 预测缓存预热失败 region={region}: {e}")
-
-
-_ml_warmup_thread = None
-_ml_warmup_started = False
+            for attempt in range(3):
+                try:
+                    data, _ = _get_prediction_data(region, str(datetime.now().year))
+                    if not data:
+                        break
+                    _build_ml_prediction_artifacts(data, region)
+                    print(f"ML 预测缓存预热完成：{region}")
+                    break
+                except Exception as e:
+                    db.session.rollback()
+                    db.session.remove()
+                    err_str = str(e).lower()
+                    if ("deadlock" in err_str or "1213" in err_str) and attempt < 2:
+                        time.sleep(1.0 * (attempt + 1))
+                        continue
+                    print(f"ML 预测缓存预热失败 region={region}: {e}")
+                    break
+                finally:
+                    db.session.remove()
 
 
 def start_async_ml_warmup(regions=None):
-    """Kick off ML cache warmup in a background thread (non-blocking)."""
+    """Kick off ML cache warmup in a background thread (non-blocking).
+
+    Uses a cross-worker lock and a short initial delay so startup schema
+    synchronization in all Gunicorn workers finishes first.
+    """
     global _ml_warmup_thread, _ml_warmup_started
     enabled = os.environ.get("ENABLE_STARTUP_ML_WARMUP", "1").lower() in ("1", "true", "yes", "on")
     if not enabled or _ml_warmup_started:
+        return None
+
+    if not _try_acquire_ml_warmup_lock():
         return None
 
     target_regions = tuple(regions or ("hk", "macau"))
 
     def _runner():
         try:
+            # 延迟几秒启动，避开所有 Worker 的 ensure_runtime_database_schema 阶段
+            time.sleep(3.0)
             warmup_ml_prediction_cache(regions=target_regions)
         except Exception as e:
             print(f"Async ML warmup failed: {e}")
+        finally:
+            _release_ml_warmup_lock()
 
     _ml_warmup_thread = threading.Thread(
         target=_runner,
