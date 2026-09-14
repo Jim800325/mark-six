@@ -13198,6 +13198,8 @@ def run_auto_strategy_optimization_job(regions=None, source="scheduler"):
             print(f"Auto strategy optimization failed: {e}")
             db.session.rollback()
             return []
+        finally:
+            db.session.remove()
 
 
 def sync_draws_from_api(region, year=None, force=False):
@@ -14625,9 +14627,27 @@ def _release_scheduler_lock():
     _scheduler_lock_path = None
     _scheduler_lock_acquired = False
 
+_last_scheduler_draw_update = {
+    "last_run_at": None,
+    "finished_at": None,
+    "status": None,
+    "message": None,
+    "error": None,
+    "regions": []
+}
+
 # 定时任务：每天21:40自动更新数据库中的开奖记录
 def update_lottery_data():
     """定时任务：更新数据库中的开奖记录"""
+    global _last_scheduler_draw_update
+    _last_scheduler_draw_update = {
+        "last_run_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "finished_at": None,
+        "status": "running",
+        "message": "任务正在执行",
+        "error": None,
+        "regions": []
+    }
     _log_draw_update("开始执行定时开奖更新任务", source="scheduler", region="all")
 
     with app.app_context():
@@ -14656,16 +14676,35 @@ def update_lottery_data():
 
             postprocess_started = _start_draw_postprocess_async(updated_region_keys, current_year, source="scheduler-postprocess")
 
+            finish_message = (
+                f"定时开奖更新任务完成 {'，'.join(updated_regions)}"
+                + ("；自动预测和回测快照已转入后台继续处理" if postprocess_started else "")
+            )
             _log_draw_update(
-                f"定时开奖更新任务完成 {'，'.join(updated_regions)}" + ("；自动预测和回测快照已转入后台继续处理" if postprocess_started else ""),
+                finish_message,
                 source="scheduler",
                 region="all",
             )
+            _last_scheduler_draw_update.update({
+                "finished_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "status": "success",
+                "message": finish_message,
+                "regions": updated_regions,
+            })
 
         except Exception as e:
             _log_draw_update(f"定时开奖更新任务失败 error={e}", source="scheduler", region="all")
             import traceback
             traceback.print_exc()
+            db.session.rollback()
+            _last_scheduler_draw_update.update({
+                "finished_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "status": "failed",
+                "error": str(e),
+                "message": f"执行失败: {e}",
+            })
+        finally:
+            db.session.remove()
 
 def warmup_auto_backtest_snapshots():
     """Ensure current backtest snapshots exist after app startup."""
@@ -14674,6 +14713,8 @@ def warmup_auto_backtest_snapshots():
             refresh_auto_backtest_snapshots(force=False)
         except Exception as e:
             print(f"Auto backtest warmup failed: {e}")
+        finally:
+            db.session.remove()
 
 
 def collect_macau_source_data_job():
@@ -14697,6 +14738,9 @@ def collect_macau_source_data_job():
             print(f"澳门号码生肖自动采集失败: {e}")
             import traceback
             traceback.print_exc()
+            db.session.rollback()
+        finally:
+            db.session.remove()
 
 
 def cleanup_expired_data_job():
@@ -14711,6 +14755,8 @@ def cleanup_expired_data_job():
             print(f"数据保留清理失败: {e}")
             import traceback
             traceback.print_exc()
+        finally:
+            db.session.remove()
 
 
 _warmup_thread = None
@@ -14812,7 +14858,18 @@ def start_scheduler(force=False):
     import atexit
     atexit.register(_release_scheduler_lock)
 
-    _scheduler = BackgroundScheduler()
+    scheduler_timezone = None
+    try:
+        from zoneinfo import ZoneInfo
+        scheduler_timezone = ZoneInfo("Asia/Shanghai")
+    except Exception:
+        try:
+            import pytz
+            scheduler_timezone = pytz.timezone("Asia/Shanghai")
+        except Exception:
+            scheduler_timezone = None
+
+    _scheduler = BackgroundScheduler(timezone=scheduler_timezone) if scheduler_timezone else BackgroundScheduler()
 
     def _log_scheduler_event(event):
         if event.code == EVENT_JOB_MISSED:
@@ -14830,7 +14887,7 @@ def start_scheduler(force=False):
         hour=20,
         minute=0,
         id='collect_macau_source_data',
-        misfire_grace_time=600,
+        misfire_grace_time=900,
         coalesce=True
     )
     _scheduler.add_job(
@@ -14838,7 +14895,8 @@ def start_scheduler(force=False):
         'cron',
         hour=21,
         minute=40,
-        misfire_grace_time=300,
+        id='update_lottery_data',
+        misfire_grace_time=900,
         coalesce=True
     )
     _scheduler.add_job(
@@ -14846,8 +14904,9 @@ def start_scheduler(force=False):
         'cron',
         hour=22,
         minute=5,
+        id='run_auto_strategy_optimization',
         kwargs={"regions": ("hk", "macau"), "source": "scheduler"},
-        misfire_grace_time=600,
+        misfire_grace_time=900,
         coalesce=True
     )
     _scheduler.add_job(
@@ -14861,8 +14920,47 @@ def start_scheduler(force=False):
     )
     _scheduler.start()
     if _should_log_startup():
-        print("定时任务已启动：每天20:00自动采集澳门号码生肖；21:40自动更新数据库中的开奖记录")
+        tz_name = getattr(scheduler_timezone, "key", None) or str(scheduler_timezone) if scheduler_timezone else "系统默认"
+        print(f"定时任务已启动（时区: {tz_name}）：每天20:00自动采集澳门号码生肖；21:40自动更新数据库中的开奖记录")
     return _scheduler
+
+
+def get_scheduler_status():
+    global _scheduler, _scheduler_lock_acquired, _last_scheduler_draw_update
+    running = bool(_scheduler and _scheduler.running)
+    timezone_name = None
+    if _scheduler and getattr(_scheduler, "timezone", None):
+        tz = _scheduler.timezone
+        timezone_name = getattr(tz, "key", None) or getattr(tz, "zone", None) or str(tz)
+
+    jobs = []
+    if running and _scheduler:
+        for job in _scheduler.get_jobs():
+            next_run = job.next_run_time
+            jobs.append({
+                "id": job.id,
+                "name": job.name,
+                "next_run_time": next_run.strftime("%Y-%m-%d %H:%M:%S %Z") if next_run else None,
+                "trigger": str(job.trigger),
+                "misfire_grace_time": job.misfire_grace_time,
+            })
+    return {
+        "enabled": os.environ.get("ENABLE_SCHEDULER", "1").lower() in ("1", "true", "yes", "on"),
+        "scheduler_running": running,
+        "scheduler_lock_acquired": _scheduler_lock_acquired,
+        "timezone": timezone_name,
+        "server_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "jobs": jobs,
+        "last_draw_update": _last_scheduler_draw_update,
+    }
+
+
+@app.route('/api/admin/scheduler_status')
+def admin_scheduler_status_api():
+    _, auth_error = _require_admin_session_json()
+    if auth_error:
+        return auth_error
+    return jsonify(get_scheduler_status())
 
 if os.environ.get("ENABLE_SCHEDULER", "1").lower() in ("1", "true", "yes", "on"):
     try:
