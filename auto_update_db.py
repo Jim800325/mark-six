@@ -246,6 +246,10 @@ def update_database():
     """更新数据库结构和数据"""
     if _using_mysql():
         return _update_mysql_database()
+    if _using_postgresql():
+        # PostgreSQL is initialized and migrated by SQLAlchemy in app.py.
+        # The remainder of this function contains SQLite-specific PRAGMA/DDL.
+        return True
     if not check_database_exists():
         print(f"数据库文件不存在: {DB_PATH}")
         print("请先运行 create_db.py 创建数据库")
