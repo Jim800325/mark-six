@@ -27,6 +27,14 @@ def _using_mysql():
     return DATABASE_URL.lower().startswith("mysql")
 
 
+def _using_postgresql():
+    """PostgreSQL schema is managed by SQLAlchemy in app.py."""
+    if DB_TYPE in ("postgres", "postgresql"):
+        return True
+    database_url = DATABASE_URL.lower()
+    return database_url.startswith("postgresql://") or database_url.startswith("postgres://") or database_url.startswith("postgresql+psycopg://")
+
+
 def _build_mysql_database_uri():
     if DATABASE_URL:
         return DATABASE_URL
