@@ -908,6 +908,12 @@ MYSQL_COLLATION = os.environ.get("MYSQL_COLLATION", "utf8mb4_unicode_ci")
 def _build_database_uri(db_path):
     db_url = os.environ.get("DATABASE_URL")
     if db_url:
+        # Neon/Vercel commonly provides a generic PostgreSQL URL. Pin SQLAlchemy
+        # to psycopg 3 so the runtime does not depend on an implicit driver.
+        if db_url.startswith("postgresql://"):
+            return "postgresql+psycopg://" + db_url[len("postgresql://"):]
+        if db_url.startswith("postgres://"):
+            return "postgresql+psycopg://" + db_url[len("postgres://"):]
         return db_url
 
     db_type = os.environ.get("DB_TYPE", "sqlite").lower()
@@ -935,6 +941,14 @@ def _build_engine_options(database_uri):
         options["connect_args"] = {
             "init_command": f"SET NAMES {MYSQL_CHARSET} COLLATE {MYSQL_COLLATION}",
         }
+    elif backend == "postgresql":
+        # Keep the SQLAlchemy pool small for serverless instances. Neon pooler
+        # handles the larger shared connection pool across Vercel functions.
+        options.update({
+            "pool_size": 2,
+            "max_overflow": 1,
+            "pool_timeout": 10,
+        })
     return options
 
 
@@ -1012,6 +1026,8 @@ def _describe_database_target(database_uri):
         return "MySQL", database_name
     if backend == "sqlite":
         return "SQLite", database_name
+    if backend == "postgresql":
+        return "PostgreSQL", database_name
     return backend or "unknown", database_name
 
 STRATEGY_LABELS = {
