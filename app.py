@@ -36,7 +36,12 @@ from api_mobile import mobile_api_bp
 from notification_service import notify_user
 
 # --- 配置信息 ---
-data_dir = os.path.join(os.getcwd(), 'data')
+# Vercel's deployed bundle is read-only. Use /tmp for ephemeral runtime files;
+# persistent application data lives in the configured SQL database.
+if os.environ.get("VERCEL"):
+    data_dir = os.path.join("/tmp", "mark-six-data")
+else:
+    data_dir = os.path.join(os.getcwd(), "data")
 os.makedirs(data_dir, exist_ok=True)
 
 
